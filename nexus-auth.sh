@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nexus-auth.sh  --  inject Sonatype Nexus credentials for the ecosystems the
+# inject Sonatype Nexus credentials for the ecosystems the
 # Veracode autopackager / SCA agent resolves dependencies for, BEFORE the
 # package / scan step runs.  Hardened for broad compatibility.
 #
@@ -25,11 +25,13 @@ set -uo pipefail   # NOT -e: each ecosystem runs in a guarded subshell so one
 
 PROJECT_DIR="${1:-.}"
 
-if [[ -z "${NEXUS_USER:-}" || -z "${NEXUS_PASS:-}" ]]; then
-  echo "NEXUS_USER / NEXUS_PASS not set, skipping Nexus credential injection"; exit 0
-fi
-if [[ -z "${NEXUS_BASE_URL:-}" ]]; then
-  echo "::error::NEXUS_BASE_URL is required when NEXUS_USER/NEXUS_PASS are set"; exit 1
+NEXUS_REQUIRE="${NEXUS_REQUIRE:-false}"
+if [[ -z "${NEXUS_USER:-}" || -z "${NEXUS_PASS:-}" || -z "${NEXUS_BASE_URL:-}" ]]; then
+  if [[ "$NEXUS_REQUIRE" == "true" ]]; then
+    echo "::error::nexus-auth: NEXUS_BASE_URL/USER/PASS expected but empty. If this step was injected, the reusable-workflow secret pass-through is misconfigured (secrets not declared or not passed). Failing closed."
+    exit 1
+  fi
+  echo "Nexus credentials not set, skipping Nexus credential injection"; exit 0
 fi
 if [[ -z "${HOME:-}" || ! -d "$HOME" ]]; then
   echo "::error::\$HOME is not set or not a directory ('$HOME')"; exit 1
@@ -46,6 +48,8 @@ NEXUS_GO_REPO="${NEXUS_GO_REPO:-${NEXUS_BASE_URL}/repository/go-group/}"
 NEXUS_MAVEN_MIRROR_OF="${NEXUS_MAVEN_MIRROR_OF:-*}"
 NEXUS_MAVEN_INJECT_REPO="${NEXUS_MAVEN_INJECT_REPO:-true}"
 NEXUS_COMPOSER_DISABLE_PACKAGIST="${NEXUS_COMPOSER_DISABLE_PACKAGIST:-false}"
+NEXUS_PIP_TRUSTED_HOST="${NEXUS_PIP_TRUSTED_HOST:-false}"   # opt-in; off keeps TLS verification on
+NEXUS_GO_SUMDB_OFF="${NEXUS_GO_SUMDB_OFF:-false}"           # opt-in; off keeps checksum-db verification
 NEXUS_MAXDEPTH="${NEXUS_MAXDEPTH:-4}"
 NEXUS_DEBUG="${NEXUS_DEBUG:-false}"
 GH_ENV="${GITHUB_ENV:-/dev/null}"
@@ -59,6 +63,9 @@ b64() { # portable base64, no wrapping
   if base64 --help 2>&1 | grep -q -- '-w'; then base64 -w0; else base64 | tr -d '\n'; fi
 }
 NPM_AUTH="$(printf '%s:%s' "$NEXUS_USER" "$NEXUS_PASS" | b64)"
+# base64(user:pass) is a transformed secret; GitHub masks only the raw values, so
+# register the derived blob explicitly to keep it out of logs.
+echo "::add-mask::$NPM_AUTH"
 
 xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"; }
 json_esc() { printf '%s' "$1" | awk 'BEGIN{ORS=""} {gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\t/,"\\t"); gsub(/\r/,"\\r"); if(NR>1) printf "\\n"; printf "%s",$0}'; }
@@ -184,30 +191,43 @@ EOF
 
 # ---------------- npm / Yarn / pnpm ----------------
 cfg_npm() {
-  local body="registry=${NEXUS_NPM_REPO}
-//${NPM_NOSCHEME}:_auth=${NPM_AUTH}
-//${NPM_NOSCHEME}:always-auth=true
+  # Registry routing (no secret) may live in the workspace; the credential must NOT,
+  # or it leaks via build artifacts / an accidental commit.
+  local reg="registry=${NEXUS_NPM_REPO}
 always-auth=true
 "
-  # scope mappings
   if [[ -n "${NEXUS_NPM_SCOPES:-}" ]]; then
     local s
     IFS=',' read -ra _scopes <<< "$NEXUS_NPM_SCOPES"
     for s in "${_scopes[@]}"; do
       s="${s// /}"; [[ -z "$s" ]] && continue
-      body+="${s}:registry=${NEXUS_NPM_REPO}
+      reg+="${s}:registry=${NEXUS_NPM_REPO}
 "
     done
   fi
-  printf '%s' "$body" >> "$PROJECT_DIR/.npmrc"
-  printf '%s' "$body" >> "$HOME/.npmrc"
-  echo "  + $PROJECT_DIR/.npmrc and ~/.npmrc"
-  # Yarn Berry (>=2): driven by env, robust against .yarnrc.yml differences
+  local auth="//${NPM_NOSCHEME}:_auth=${NPM_AUTH}
+//${NPM_NOSCHEME}:always-auth=true
+"
+  printf '%s%s' "$reg" "$auth" >> "$HOME/.npmrc"   # creds: user-level only
+  printf '%s' "$reg" >> "$PROJECT_DIR/.npmrc"       # workspace: routing only, no creds
+  echo "  + ~/.npmrc (with auth) and $PROJECT_DIR/.npmrc (routing only)"
+  # Yarn Berry (>=2): env-driven. npmAuthIdent encoding differs by major version:
+  #   yarn 2 expects base64(user:pass); yarn 3+ expects raw user:pass.
   if [[ -f "$PROJECT_DIR/.yarnrc.yml" ]] || [[ -d "$PROJECT_DIR/.yarn/releases" ]] || grep -qsE '"packageManager"\s*:\s*"yarn@[2-9]' "$PROJECT_DIR/package.json"; then
+    local ymajor=""
+    if [[ -f "$PROJECT_DIR/package.json" ]]; then
+      ymajor="$(grep -oE '"yarn@[0-9]+' "$PROJECT_DIR/package.json" 2>/dev/null | grep -oE '[0-9]+' | head -n1)"
+    fi
+    if [[ -z "$ymajor" ]]; then
+      local _rel; _rel="$(ls "$PROJECT_DIR"/.yarn/releases/yarn-*.cjs 2>/dev/null | head -n1)"
+      [[ -n "$_rel" ]] && ymajor="$(basename "$_rel" | grep -oE 'yarn-[0-9]+' | grep -oE '[0-9]+')"
+    fi
+    local ident; if [[ "$ymajor" == "2" ]]; then ident="$NPM_AUTH"; else ident="${NEXUS_USER}:${NEXUS_PASS}"; fi
+    echo "::add-mask::$ident"
     set_env YARN_NPM_REGISTRY_SERVER "$NEXUS_NPM_REPO"
     set_env YARN_NPM_ALWAYS_AUTH "true"
-    set_env YARN_NPM_AUTH_IDENT "$NPM_AUTH"
-    echo "  + Yarn Berry env (YARN_NPM_*)"
+    set_env YARN_NPM_AUTH_IDENT "$ident"
+    echo "  + Yarn Berry env (YARN_NPM_*, ident for yarn ${ymajor:-3+})"
   fi
 }
 
@@ -215,26 +235,31 @@ always-auth=true
 cfg_pip() {
   local conf="[global]
 index-url = ${NEXUS_PYPI_REPO}
-trusted-host = ${HOST}
 "
+  if [[ "$NEXUS_PIP_TRUSTED_HOST" == "true" ]]; then
+    conf+="trusted-host = ${HOST}
+"
+  fi
   mkdir -p "$HOME/.config/pip" "$HOME/.pip"
   printf '%s' "$conf" > "$HOME/.config/pip/pip.conf"
   printf '%s' "$conf" > "$HOME/.pip/pip.conf"
   set_env PIP_INDEX_URL "$NEXUS_PYPI_REPO"
-  set_env PIP_TRUSTED_HOST "$HOST"
+  [[ "$NEXUS_PIP_TRUSTED_HOST" == "true" ]] && set_env PIP_TRUSTED_HOST "$HOST"
   set_env PIPENV_PYPI_MIRROR "$NEXUS_PYPI_REPO"
   # poetry best-effort: assumes a source named 'nexus' in pyproject if poetry is used
   set_env POETRY_HTTP_BASIC_NEXUS_USERNAME "$NEXUS_USER"
   set_env POETRY_HTTP_BASIC_NEXUS_PASSWORD "$NEXUS_PASS"
-  echo "  + pip.conf (x2) + PIP_/PIPENV_/POETRY_ env (creds via ~/.netrc)"
+  echo "  + pip.conf (x2) + PIP_/PIPENV_/POETRY_ env (creds via ~/.netrc; trusted-host=${NEXUS_PIP_TRUSTED_HOST})"
 }
 
 # ---------------- Go ----------------
 cfg_go() {
   set_env GOPROXY "$NEXUS_GO_REPO"
-  set_env GOSUMDB "off"
+  # Keep checksum-db verification ON by default (supply-chain integrity). Private
+  # module paths bypass it via GOPRIVATE; only disable wholesale on explicit opt-in.
+  [[ "$NEXUS_GO_SUMDB_OFF" == "true" ]] && set_env GOSUMDB "off"
   [[ -n "${NEXUS_GO_PRIVATE:-}" ]] && set_env GOPRIVATE "$NEXUS_GO_PRIVATE"
-  echo "  + GOPROXY/GOSUMDB env (creds via ~/.netrc)"
+  echo "  + GOPROXY env (GOSUMDB off=${NEXUS_GO_SUMDB_OFF}; creds via ~/.netrc)"
 }
 
 # ---------------- Composer ----------------
@@ -255,23 +280,13 @@ cfg_composer() {
 # ---------------- Ruby / Bundler ----------------
 bundle_key() { printf '%s' "$1" | sed -E 's/-/___/g; s/\./__/g; s/:/__/g' | tr '[:lower:]' '[:upper:]'; }
 cfg_ruby() {
-  # auth the Nexus host plus every host referenced as a source in the Gemfile
-  local hosts="$HOST"
-  local gf; gf="$(found -name Gemfile | head -n1)"
-  if [[ -n "$gf" ]]; then
-    local extra
-    extra="$(grep -hoE "https?://[^'\"[:space:]/]+" "$gf" 2>/dev/null | sed -E 's#^https?://##' | sort -u)"
-    [[ -n "$extra" ]] && hosts="$hosts
-$extra"
-  fi
-  local h seen=""
-  while IFS= read -r h; do
-    [[ -z "$h" ]] && continue
-    case " $seen " in *" $h "*) continue;; esac
-    seen="$seen $h"
-    set_env "BUNDLE_$(bundle_key "$h")" "${NEXUS_USER}:${NEXUS_PASS}"
-    echo "  + BUNDLE_$(bundle_key "$h") env"
-  done <<< "$hosts"
+  # Scope Nexus credentials to the Nexus host ONLY. Enumerating hosts from the
+  # Gemfile would send these credentials to any source an attacker can add to the
+  # Gemfile (a PR-controlled exfiltration path), so we deliberately do not do it.
+  local secret="${NEXUS_USER}:${NEXUS_PASS}"
+  echo "::add-mask::$secret"
+  set_env "BUNDLE_$(bundle_key "$HOST")" "$secret"
+  echo "  + BUNDLE_$(bundle_key "$HOST") env (Nexus host only)"
 }
 
 # ---------------- dispatch ----------------
