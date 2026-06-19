@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-veracode-nexus-rollout.py
-
-Fleet rollout for Nexus credential injection into the Veracode GitHub Workflow
+Nexus credential injection into the Veracode GitHub Workflow
 Integration repos. Modeled on the onboarding rollout helper: shared rate
 limiter, retries, org discovery (enterprise / orgs-file / user orgs), parallel
 workers, checkpoint/resume, JSON + CSV reporting, dry-run/apply with a
@@ -305,8 +303,16 @@ def paginate_list(url: str, token: str, params: dict[str, Any] | None = None) ->
 
 def list_orgs_graphql(api_base: str, token: str, enterprise: str) -> list[str] | None:
     try:
-        graphql_url = ("https://api.github.com/graphql" if "api.github.com" in api_base
-                       else f"{api_base.rstrip('/')}/graphql")
+        if "api.github.com" in api_base:
+            graphql_url = "https://api.github.com/graphql"
+        else:
+            # GHES REST base is https://HOST/api/v3 ; GraphQL is https://HOST/api/graphql
+            root = api_base.rstrip("/")
+            if root.endswith("/api/v3"):
+                root = root[: -len("/v3")]
+            elif root.endswith("/v3"):
+                root = root[: -len("/v3")]
+            graphql_url = f"{root}/graphql"
         query = """
         query($enterprise: String!, $cursor: String) {
           enterprise(slug: $enterprise) {
@@ -399,6 +405,14 @@ def repo_is_empty(api_base: str, org: str, repo: str, token: str) -> bool:
         return False
 
 
+def get_repo_id(api_base: str, org: str, repo: str, token: str) -> int | None:
+    r = request("GET", f"{api_base}/repos/{org}/{repo}", token)
+    if r.status_code == 200:
+        rid = r.json().get("id")
+        return int(rid) if rid is not None else None
+    return None
+
+
 def get_org_public_key(api_base: str, org: str, token: str, log: Callable[[str], None] = tprint) -> tuple[str, str] | None:
     r = request("GET", f"{api_base}/orgs/{org}/actions/secrets/public-key", token)
     if r.status_code != 200:
@@ -431,17 +445,24 @@ def check_nexus_secrets_status(api_base: str, org: str, token: str) -> dict[str,
     return out
 
 
-def set_nexus_secrets(api_base: str, org: str, token: str, values: dict[str, str],
+def set_nexus_secrets(api_base: str, org: str, token: str, values: dict[str, str], repo: str,
                       log: Callable[[str], None] = tprint) -> tuple[bool, dict[str, str]]:
     key_info = get_org_public_key(api_base, org, token, log)
     if not key_info:
         return False, {s: "failed" for s in SECRET_NAMES}
     key_id, public_key = key_info
+    # Scope the secrets to the integration repo ONLY. Never fall back to org-wide
+    # visibility: that would expose the Nexus credentials to every repo in the org.
+    repo_id = get_repo_id(api_base, org, repo, token)
+    if not repo_id:
+        log(f"  [{org}] cannot resolve id for '{repo}'; refusing to set org-wide secrets")
+        return False, {s: "failed_no_repo_scope" for s in SECRET_NAMES}
     results: dict[str, str] = {}
     for name in SECRET_NAMES:
         try:
             payload = {"encrypted_value": encrypt_secret(public_key, values[name]),
-                       "key_id": key_id, "visibility": "all"}
+                       "key_id": key_id, "visibility": "selected",
+                       "selected_repository_ids": [repo_id]}
             r = request("PUT", f"{api_base}/orgs/{org}/actions/secrets/{name}", token, json=payload)
             ok = r.status_code in (201, 204)
             if not ok:
@@ -466,6 +487,7 @@ _ENV_BLOCK = (
     "    NEXUS_BASE_URL: ${{ secrets.VERACODE_NEXUS_BASE_URL }}\n"
     "    NEXUS_USER: ${{ secrets.VERACODE_NEXUS_USER }}\n"
     "    NEXUS_PASS: ${{ secrets.VERACODE_NEXUS_PASS }}\n"
+    "    NEXUS_REQUIRE: 'true'\n"
 )
 
 
@@ -536,8 +558,8 @@ def _pass_secrets(text: str, uses_text: str) -> str:
 def transform(path: str, text: str) -> str:
     if path == WF_DEFAULT_BUILD:
         if STEP_MARKER not in text:
-            text = _insert_before(text, "- name: Package the application", [_step("Linux", "source-code", False)])
-            text = _insert_before(text, "- name: Install Veracode CLI", [_step("Windows", "source-code", False)])
+            text = _insert_before(text, "- name: Package the application", [_step("Linux", "source-code", True)])
+            text = _insert_before(text, "- name: Install Veracode CLI", [_step("Windows", "source-code", True)])
         return _declare_secrets(text)
     if path == WF_SCA:
         if STEP_MARKER in text:
@@ -567,12 +589,77 @@ def _valid_yaml(text: str) -> bool:
         return False
 
 
+PR_WORK_BRANCH = "nexus-credential-injection"
+
+
+def commit_files(api_base: str, org: str, repo: str, token: str, branch: str,
+                 files: dict[str, str], message: str, use_pr: bool = False,
+                 log: Callable[[str], None] = tprint) -> tuple[str, str | None]:
+    """Write all files in ONE atomic commit via the Git Data API.
+
+    Returns (status, detail). status in: ok | pr | protected_branch | error.
+    Atomic: either every file lands in a single commit or nothing changes, so a
+    failure can never leave the repo half-patched. One commit also means at most
+    one push event (vs one per file with the Contents API)."""
+    def g(method: str, path: str, **kw: Any) -> requests.Response:
+        return request(method, f"{api_base}/repos/{org}/{repo}/git/{path}", token, **kw)
+
+    r = g("GET", f"ref/heads/{branch}")
+    if r.status_code != 200:
+        return "error", f"get ref heads/{branch} -> {r.status_code}"
+    head_sha = (r.json().get("object") or {}).get("sha")
+    if not head_sha:
+        return "error", "no head sha"
+    r = g("GET", f"commits/{head_sha}")
+    if r.status_code != 200:
+        return "error", f"get commit -> {r.status_code}"
+    base_tree = (r.json().get("tree") or {}).get("sha")
+
+    tree = [{"path": p, "mode": "100644", "type": "blob", "content": c}
+            for p, c in sorted(files.items())]
+    r = g("POST", "trees", json={"base_tree": base_tree, "tree": tree})
+    if r.status_code not in (200, 201):
+        return "error", f"create tree -> {r.status_code} {(r.text or '')[:160]}"
+    new_tree = r.json().get("sha")
+    r = g("POST", "commits", json={"message": message, "tree": new_tree, "parents": [head_sha]})
+    if r.status_code not in (200, 201):
+        return "error", f"create commit -> {r.status_code} {(r.text or '')[:160]}"
+    new_commit = r.json().get("sha")
+
+    if use_pr:
+        r = g("POST", "refs", json={"ref": f"refs/heads/{PR_WORK_BRANCH}", "sha": new_commit})
+        if r.status_code == 422:  # work branch already exists -> fast-forward it
+            r = g("PATCH", f"refs/heads/{PR_WORK_BRANCH}", json={"sha": new_commit, "force": True})
+            if r.status_code not in (200, 201):
+                return "error", f"update work ref -> {r.status_code}"
+        elif r.status_code not in (200, 201):
+            return "error", f"create work ref -> {r.status_code} {(r.text or '')[:160]}"
+        pr = request("POST", f"{api_base}/repos/{org}/{repo}/pulls", token,
+                     json={"title": "Nexus credential injection",
+                           "head": PR_WORK_BRANCH, "base": branch,
+                           "body": "Automated Nexus credential injection for the Veracode integration."})
+        if pr.status_code in (200, 201):
+            return "pr", pr.json().get("html_url", "")
+        if pr.status_code == 422 and "already exist" in (pr.text or "").lower():
+            return "pr", "(existing PR updated)"
+        return "error", f"open PR -> {pr.status_code} {(pr.text or '')[:160]}"
+
+    r = g("PATCH", f"refs/heads/{branch}", json={"sha": new_commit, "force": False})
+    if r.status_code in (200, 201):
+        return "ok", None
+    body = (r.text or "").lower()
+    if r.status_code in (403, 422) and ("protect" in body or "required status" in body):
+        return "protected_branch", branch
+    return "error", f"update ref -> {r.status_code} {(r.text or '')[:160]}"
+
+
 def inject_nexus_auth_into_repo(api_base: str, org: str, repo: str, token: str,
                                 helper_sh: str, helper_ps1: str, branch: str = "main",
-                                dry_run: bool = False,
+                                dry_run: bool = False, use_pr: bool = False,
                                 log: Callable[[str], None] = tprint) -> tuple[bool, dict]:
     """status in: injected | would_inject | already_current | off_template |
-    partial | protected_branch | error."""
+    protected_branch | error. All writes land in a single atomic commit, so there
+    is no partial-write state."""
     base = f"{api_base}/repos/{org}/{repo}/contents"
 
     def get_file(path: str) -> tuple[str | None, str | None]:
@@ -617,42 +704,22 @@ def inject_nexus_auth_into_repo(api_base: str, org: str, repo: str, token: str,
         return True, {"status": "would_inject",
                       "files": [p for p, _, _ in helper_plan] + [p for p, _, _ in plan]}
 
-    def put_file(path: str, content: str, sha: str | None, message: str) -> str:
-        payload = {"message": message,
-                   "content": b64encode(content.encode("utf-8")).decode("utf-8"),
-                   "branch": branch}
-        if sha:
-            payload["sha"] = sha
-        r = request("PUT", f"{base}/{path}", token, json=payload)
-        if r.status_code == 409:
-            _, fresh = get_file(path)
-            payload["sha"] = fresh
-            r = request("PUT", f"{base}/{path}", token, json=payload)
-        if r.status_code in (200, 201):
-            return "ok"
-        if r.status_code == 422 and "protected branch" in (r.text or "").lower():
-            return "protected_branch"
-        if r.status_code == 409:
-            return "protected_branch"
-        log(f"  [{org}] PUT {path} failed: {r.status_code} {(r.text or '')[:160]}")
-        return "error"
-
-    written: list[str] = []
-    for path, body, sha in helper_plan:
-        st = put_file(path, body, sha, "Add Nexus credential helper script")
-        if st == "protected_branch":
-            return False, {"status": "protected_branch", "detail": path}
-        if st != "ok":
-            return False, {"status": "partial", "written": written, "detail": path}
-        written.append(path)
-    for path, new, sha in plan:
-        st = put_file(path, new, sha, "Add Nexus credential injection (static + SCA)")
-        if st == "protected_branch":
-            return False, {"status": "protected_branch", "detail": path, "written": written}
-        if st != "ok":
-            return False, {"status": "partial", "written": written, "detail": path}
-        written.append(path)
-    return True, {"status": "injected", "written": written}
+    # One atomic commit for every file (helpers + workflows). No partial state.
+    files = {p: body for p, body, _ in helper_plan}
+    files.update({p: new for p, new, _ in plan})
+    status, detail = commit_files(
+        api_base, org, repo, token, branch, files,
+        "Add Nexus credential injection (helper scripts + workflow plumbing)",
+        use_pr=use_pr, log=log)
+    written = sorted(files.keys())
+    if status == "ok":
+        return True, {"status": "injected", "written": written}
+    if status == "pr":
+        return True, {"status": "injected", "mode": "pr", "pr_url": detail, "written": written}
+    if status == "protected_branch":
+        return False, {"status": "protected_branch", "detail": detail}
+    log(f"  [{org}] commit failed: {detail}")
+    return False, {"status": "error", "detail": detail}
 
 
 # =============================================================================
@@ -694,6 +761,7 @@ class RunContext:
     total_orgs: int
     report_path: Path
     checkpoint_file: Path
+    use_pr: bool = False
     stats: RunStats = field(default_factory=RunStats)
     stats_lock: threading.Lock = field(default_factory=threading.Lock)
     report_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -781,25 +849,32 @@ def process_org(org: str, org_idx: int, ctx: RunContext) -> None:
                              "timestamp_readable": now.strftime("%Y-%m-%d %H:%M:%S %A")}
     repo = ctx.repo_name
 
+    present = False
+    repo_note = "missing_or_empty"
     try:
-        present = repo_exists(ctx.api_base, org, repo, ctx.token) and not repo_is_empty(ctx.api_base, org, repo, ctx.token)
+        if repo_exists(ctx.api_base, org, repo, ctx.token):
+            present = not repo_is_empty(ctx.api_base, org, repo, ctx.token)
+            repo_note = "empty" if not present else "ok"
+        else:
+            repo_note = "missing"
     except Exception as exc:
-        present = False
-        log(f"  Repo check error: {str(exc)[:80]}")
+        msg = str(exc)
+        repo_note = "no_permission" if "403" in msg else "check_error"
+        log(f"  Repo check error: {msg[:80]}")
 
     if not present:
         entry["nexus_auth"] = {"status": "skip_no_repo"}
         with ctx.stats_lock:
             ctx.stats.repo_missing += 1
         with ctx.rows_lock:
-            ctx.missing_repo_rows.append([org, repo, "missing_or_empty"])
-        log(f"  Repo: [SKIP] (no '{repo}' repo)")
+            ctx.missing_repo_rows.append([org, repo, repo_note])
+        log(f"  Repo: [SKIP] ({repo_note})")
     else:
         try:
             ok, nx = inject_nexus_auth_into_repo(
                 ctx.api_base, org, repo, ctx.token,
                 ctx.helper_sh, ctx.helper_ps1, branch=ctx.branch,
-                dry_run=ctx.dry_run, log=log,
+                dry_run=ctx.dry_run, use_pr=ctx.use_pr, log=log,
             )
             entry["nexus_auth"] = nx
             status = nx.get("status", "error")
@@ -849,7 +924,7 @@ def process_org(org: str, org_idx: int, ctx: RunContext) -> None:
             log(f"  Secrets check error: {str(exc)[:80]}")
     elif ctx.do_set_secrets and present:
         try:
-            ok, results = set_nexus_secrets(ctx.api_base, org, ctx.token, ctx.secret_values, log=log)
+            ok, results = set_nexus_secrets(ctx.api_base, org, ctx.token, ctx.secret_values, repo, log=log)
             entry["secrets"] = {"status": "set" if ok else "partial", "results": results}
             with ctx.stats_lock:
                 if ok:
@@ -895,7 +970,8 @@ def main() -> None:
 
     ap.add_argument("--set-nexus-secrets", action="store_true",
                     help="[apply] Also set the three VERACODE_NEXUS_* org secrets from env values "
-                         "(NEXUS_BASE_URL / NEXUS_USER / NEXUS_PASS). Requires pynacl.")
+                         "(NEXUS_BASE_URL / NEXUS_USER / NEXUS_PASS), scoped to the integration repo "
+                         "only (visibility=selected). Requires pynacl.")
     ap.add_argument("--enterprise", help="GitHub Enterprise slug for org discovery.")
     ap.add_argument("--orgs-file", help="File with one org login per line.")
     ap.add_argument("--repo-name", default=INTEGRATION_REPO_NAME, help="Integration repo name (default: veracode).")
@@ -906,6 +982,9 @@ def main() -> None:
     ap.add_argument("--skip-to", help="Skip all orgs before this one.")
     ap.add_argument("--continue", dest="resume", action="store_true", help="Resume from checkpoint.json.")
     ap.add_argument("--workers", type=int, default=1, help="Parallel worker threads (default 1; recommended 3-5).")
+    ap.add_argument("--pr", action="store_true",
+                    help="[apply] Open a pull request per repo instead of committing to the branch "
+                         "(governance-friendly; respects review/CODEOWNERS).")
     args = ap.parse_args()
 
     if yaml is None:
@@ -940,7 +1019,7 @@ def main() -> None:
             print(f"ERROR: {name} not found next to script (or in ./helper/).", file=sys.stderr)
             sys.exit(1)
     helper_sh = sh_path.read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
-    helper_ps1 = ps_path.read_text(encoding="utf-8")
+    helper_ps1 = ps_path.read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
 
     secret_values: dict[str, str] = {}
     if do_set_secrets:
@@ -965,6 +1044,7 @@ def main() -> None:
     print(f"MODE: {'APPLY' if args.apply else 'DRY-RUN'}")
     print(f"  Inject Nexus auth     : YES")
     print(f"  Set Nexus secrets     : {'YES' if do_set_secrets else 'NO (--set-nexus-secrets)'}")
+    print(f"  Write mode            : {'PULL REQUEST' if args.pr else 'direct commit to branch'}")
     print(f"  Repo / branch         : {args.repo_name} / {args.branch}")
     print(f"  Workers               : {args.workers}{' (parallel)' if args.workers > 1 else ''}")
     print(f"{'=' * 60}")
@@ -1002,6 +1082,7 @@ def main() -> None:
     if args.apply and not args.resume:
         print(f"\n{'=' * 60}\n   CONFIRMATION REQUIRED\n{'=' * 60}")
         print(f"About to modify up to {total} '{args.repo_name}' repos on branch '{args.branch}'.")
+        print("  - open a PR per repo" if args.pr else "  - commit directly to the branch")
         print("  - inject helper scripts + workflow plumbing")
         if do_set_secrets:
             print("  - set/overwrite the three VERACODE_NEXUS_* org secrets")
@@ -1017,7 +1098,7 @@ def main() -> None:
         api_base=api_base, token=token, branch=args.branch, dry_run=args.dry_run,
         do_set_secrets=do_set_secrets, helper_sh=helper_sh, helper_ps1=helper_ps1,
         repo_name=args.repo_name, secret_values=secret_values, total_orgs=total,
-        report_path=report_path, checkpoint_file=checkpoint_file,
+        report_path=report_path, checkpoint_file=checkpoint_file, use_pr=args.pr,
         stats=RunStats(total_orgs=total),
     )
 
