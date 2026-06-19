@@ -1,5 +1,5 @@
 <#
-  nexus-auth.ps1  --  Windows equivalent of nexus-auth.sh (hardened).
+  Windows equivalent of nexus-auth.sh (hardened).
   Runs directly on the runner (no container); files land in $env:USERPROFILE,
   env vars go to $env:GITHUB_ENV for the later package step. Requires pwsh 7.
 
@@ -13,10 +13,14 @@
 param([string]$ProjectDir = ".")
 $ErrorActionPreference = "Stop"
 
-if (-not $env:NEXUS_USER -or -not $env:NEXUS_PASS) {
-  Write-Host "NEXUS_USER / NEXUS_PASS not set, skipping Nexus credential injection"; exit 0
+$require = ($env:NEXUS_REQUIRE -eq 'true')
+if (-not $env:NEXUS_USER -or -not $env:NEXUS_PASS -or -not $env:NEXUS_BASE_URL) {
+  if ($require) {
+    Write-Error "nexus-auth: NEXUS_BASE_URL/USER/PASS expected but empty. If this step was injected, the reusable-workflow secret pass-through is misconfigured. Failing closed."
+    exit 1
+  }
+  Write-Host "Nexus credentials not set, skipping Nexus credential injection"; exit 0
 }
-if (-not $env:NEXUS_BASE_URL) { Write-Error "NEXUS_BASE_URL is required"; exit 1 }
 
 $U = $env:NEXUS_USER; $P = $env:NEXUS_PASS; $base = $env:NEXUS_BASE_URL
 $mvnRepo = if ($env:NEXUS_MAVEN_REPO) { $env:NEXUS_MAVEN_REPO } else { "$base/repository/maven-public/" }
@@ -31,6 +35,7 @@ $host_      = ($base -replace '^https?://','') -replace '/.*$',''
 $hostNoPort = $host_ -replace ':.*$',''
 $npmNoScheme = $npmRepo -replace '^https?://',''
 $npmAuth = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($U):$($P)"))
+Write-Host "::add-mask::$npmAuth"
 $home_ = $env:USERPROFILE
 $prune = '\\(node_modules|vendor|\.git|\.gradle|build|dist|target)\\'
 
@@ -142,23 +147,34 @@ allprojects {
 # npm / Yarn / pnpm
 if ($hasNpm) {
   Invoke-Eco 'npm' {
-    $body = "registry=$npmRepo`n//${npmNoScheme}:_auth=$npmAuth`n//${npmNoScheme}:always-auth=true`nalways-auth=true`n"
+    $reg = "registry=$npmRepo`nalways-auth=true`n"
     if ($env:NEXUS_NPM_SCOPES) {
       foreach ($s in ($env:NEXUS_NPM_SCOPES -split ',')) {
-        $s = $s.Trim(); if ($s) { $body += "${s}:registry=$npmRepo`n" }
+        $s = $s.Trim(); if ($s) { $reg += "${s}:registry=$npmRepo`n" }
       }
     }
-    Add-Content -Path (Join-Path $ProjectDir ".npmrc") -Value $body -Encoding ascii
-    Add-Content -Path (Join-Path $home_ ".npmrc") -Value $body -Encoding ascii
-    Write-Host "  + .npmrc (project + user)"
+    $auth = "//${npmNoScheme}:_auth=$npmAuth`n//${npmNoScheme}:always-auth=true`n"
+    # Credential goes to the user-level file only; the workspace file gets routing only.
+    Add-Content -Path (Join-Path $home_ ".npmrc") -Value ($reg + $auth) -Encoding ascii
+    Add-Content -Path (Join-Path $ProjectDir ".npmrc") -Value $reg -Encoding ascii
+    Write-Host "  + ~/.npmrc (with auth) + project .npmrc (routing only)"
     $pj = Join-Path $ProjectDir "package.json"
     $berry = (Test-Path (Join-Path $ProjectDir ".yarnrc.yml")) -or (Test-Path (Join-Path $ProjectDir ".yarn\releases")) -or `
              ((Test-Path $pj) -and ((Get-Content $pj -Raw) -match '"packageManager"\s*:\s*"yarn@[2-9]'))
     if ($berry) {
+      $ymajor = $null
+      if ((Test-Path $pj) -and ((Get-Content $pj -Raw) -match '"packageManager"\s*:\s*"yarn@([0-9]+)')) { $ymajor = $Matches[1] }
+      if (-not $ymajor) {
+        $rel = Get-ChildItem -Path (Join-Path $ProjectDir ".yarn\releases") -Filter 'yarn-*.cjs' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($rel -and $rel.Name -match 'yarn-([0-9]+)') { $ymajor = $Matches[1] }
+      }
+      # yarn 2 expects base64(user:pass); yarn 3+ expects raw user:pass.
+      $ident = if ($ymajor -eq '2') { $npmAuth } else { "$($U):$($P)" }
+      Write-Host "::add-mask::$ident"
       Set-GhEnv 'YARN_NPM_REGISTRY_SERVER' $npmRepo
       Set-GhEnv 'YARN_NPM_ALWAYS_AUTH' 'true'
-      Set-GhEnv 'YARN_NPM_AUTH_IDENT' $npmAuth
-      Write-Host "  + Yarn Berry env"
+      Set-GhEnv 'YARN_NPM_AUTH_IDENT' $ident
+      Write-Host "  + Yarn Berry env (ident for yarn $(if ($ymajor) { $ymajor } else { '3+' }))"
     }
   }
 }
@@ -166,15 +182,17 @@ if ($hasNpm) {
 # pip / pipenv / poetry
 if ($hasPython) {
   Invoke-Eco 'pip' {
-    $conf = "[global]`nindex-url = $pyRepo`ntrusted-host = $host_`n"
+    $trusted = ($env:NEXUS_PIP_TRUSTED_HOST -eq 'true')
+    $conf = "[global]`nindex-url = $pyRepo`n"
+    if ($trusted) { $conf += "trusted-host = $host_`n" }
     $pipDir = Join-Path $env:APPDATA "pip"; New-Item -ItemType Directory -Force -Path $pipDir | Out-Null
     $conf | Out-File -FilePath (Join-Path $pipDir "pip.ini") -Encoding ascii
     Set-GhEnv 'PIP_INDEX_URL' $pyRepo
-    Set-GhEnv 'PIP_TRUSTED_HOST' $host_
+    if ($trusted) { Set-GhEnv 'PIP_TRUSTED_HOST' $host_ }
     Set-GhEnv 'PIPENV_PYPI_MIRROR' $pyRepo
     Set-GhEnv 'POETRY_HTTP_BASIC_NEXUS_USERNAME' $U
     Set-GhEnv 'POETRY_HTTP_BASIC_NEXUS_PASSWORD' $P
-    Write-Host "  + pip.ini + PIP_/PIPENV_/POETRY_ env"
+    Write-Host "  + pip.ini + PIP_/PIPENV_/POETRY_ env (trusted-host=$trusted)"
   }
 }
 
@@ -182,9 +200,9 @@ if ($hasPython) {
 if ($hasGo) {
   Invoke-Eco 'go' {
     Set-GhEnv 'GOPROXY' $goRepo
-    Set-GhEnv 'GOSUMDB' 'off'
+    if ($env:NEXUS_GO_SUMDB_OFF -eq 'true') { Set-GhEnv 'GOSUMDB' 'off' }
     if ($env:NEXUS_GO_PRIVATE) { Set-GhEnv 'GOPRIVATE' $env:NEXUS_GO_PRIVATE }
-    Write-Host "  + GOPROXY/GOSUMDB env"
+    Write-Host "  + GOPROXY env (GOSUMDB off=$($env:NEXUS_GO_SUMDB_OFF -eq 'true'))"
   }
 }
 
@@ -209,20 +227,13 @@ if ($hasComposer) {
 # Ruby / Bundler
 if ($hasRuby) {
   Invoke-Eco 'ruby' {
-    $hosts = New-Object System.Collections.Generic.List[string]
-    $hosts.Add($host_)
-    $gf = Get-ChildItem -Path $ProjectDir -Filter Gemfile -Recurse -Depth $maxDepth -File -ErrorAction SilentlyContinue |
-          Where-Object { $_.FullName -notmatch $prune } | Select-Object -First 1
-    if ($gf) {
-      foreach ($m in ([regex]::Matches((Get-Content $gf.FullName -Raw), 'https?://([^/''"\s]+)'))) {
-        $h = $m.Groups[1].Value; if (-not $hosts.Contains($h)) { $hosts.Add($h) }
-      }
-    }
-    foreach ($h in $hosts) {
-      $key = ($h -replace '-','___' -replace '\.','__' -replace ':','__').ToUpper()
-      Set-GhEnv "BUNDLE_$key" "$($U):$($P)"
-      Write-Host "  + BUNDLE_$key env"
-    }
+    # Scope to the Nexus host ONLY. Do not enumerate Gemfile sources: that would
+    # leak Nexus credentials to any host an attacker can add to the Gemfile.
+    $key = ($host_ -replace '-','___' -replace '\.','__' -replace ':','__').ToUpper()
+    $secret = "$($U):$($P)"
+    Write-Host "::add-mask::$secret"
+    Set-GhEnv "BUNDLE_$key" $secret
+    Write-Host "  + BUNDLE_$key env (Nexus host only)"
   }
 }
 
