@@ -40,6 +40,7 @@ $home_ = $env:USERPROFILE
 $prune = '\\(node_modules|vendor|\.git|\.gradle|build|dist|target)\\'
 
 function Set-GhEnv([string]$name, [string]$value) {
+  if (-not $env:GITHUB_ENV) { return }
   $d = "NEXUSENV_EOF_" + [guid]::NewGuid().ToString('N')
   "$name<<$d`n$value`n$d" | Out-File -FilePath $env:GITHUB_ENV -Append
 }
@@ -74,7 +75,15 @@ if ($hasPython -or $hasGo) {
   Invoke-Eco 'netrc' {
     $netrcPath = Join-Path $home_ "_netrc"
     if (Test-Path $netrcPath) {
-      $kept = Get-Content $netrcPath | Where-Object { $_ -notmatch "^machine\s+$([regex]::Escape($hostNoPort))$" }
+      # Remove the old 3-line block (machine + login + password) for this host
+      $lines = Get-Content $netrcPath
+      $kept = @()
+      $skip = 0
+      foreach ($line in $lines) {
+        if ($skip -gt 0) { $skip--; continue }
+        if ($line -match "^machine\s+$([regex]::Escape($hostNoPort))$") { $skip = 2; continue }
+        $kept += $line
+      }
       Set-Content -Path $netrcPath -Value $kept -Encoding ascii
     }
     Add-Content -Path $netrcPath -Value "machine $hostNoPort`n  login $U`n  password $P" -Encoding ascii
