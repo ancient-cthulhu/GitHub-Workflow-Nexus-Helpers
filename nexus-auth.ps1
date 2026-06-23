@@ -7,8 +7,9 @@
   Required env: NEXUS_BASE_URL, NEXUS_USER, NEXUS_PASS
   Optional knobs mirror nexus-auth.sh (NEXUS_MAVEN_REPO, NEXUS_MAVEN_MIRROR_OF,
   NEXUS_MAVEN_INJECT_REPO, NEXUS_NPM_REPO, NEXUS_NPM_SCOPES, NEXUS_PYPI_REPO,
-  NEXUS_GO_REPO, NEXUS_GO_PRIVATE, NEXUS_COMPOSER_REPO,
-  NEXUS_COMPOSER_DISABLE_PACKAGIST, NEXUS_MAXDEPTH).
+  NEXUS_PIP_TRUSTED_HOST, NEXUS_GO_REPO, NEXUS_GO_PRIVATE, NEXUS_GO_SUMDB_OFF,
+  NEXUS_COMPOSER_REPO, NEXUS_COMPOSER_DISABLE_PACKAGIST,
+  NEXUS_SBT_REPO (default: NEXUS_MAVEN_REPO), NEXUS_MAXDEPTH).
 #>
 param([string]$ProjectDir = ".")
 $ErrorActionPreference = "Stop"
@@ -30,6 +31,7 @@ $goRepo  = if ($env:NEXUS_GO_REPO)    { $env:NEXUS_GO_REPO }    else { "$base/re
 $mirrorOf = if ($env:NEXUS_MAVEN_MIRROR_OF) { $env:NEXUS_MAVEN_MIRROR_OF } else { "*" }
 $injectRepo = ($env:NEXUS_MAVEN_INJECT_REPO -ne "false")
 $maxDepth = if ($env:NEXUS_MAXDEPTH) { [int]$env:NEXUS_MAXDEPTH } else { 4 }
+$sbtRepo  = if ($env:NEXUS_SBT_REPO)  { $env:NEXUS_SBT_REPO }  else { $mvnRepo }
 
 $host_      = ($base -replace '^https?://','') -replace '/.*$',''
 $hostNoPort = $host_ -replace ':.*$',''
@@ -58,6 +60,7 @@ function Invoke-Eco([string]$name, [scriptblock]$body) {
 
 $hasMaven    = Test-Any @('pom.xml')
 $hasGradle   = Test-Any @('build.gradle','build.gradle.kts','settings.gradle','settings.gradle.kts')
+$hasSbt      = Test-Any @('build.sbt')
 $hasPython   = Test-Any @('requirements*.txt','pyproject.toml','setup.py','setup.cfg','Pipfile')
 $hasNpm      = Test-Any @('package.json')
 $hasGo       = Test-Any @('go.mod')
@@ -150,6 +153,41 @@ allprojects {
     Set-GhEnv 'NEXUS_MAVEN_REPO_RESOLVED' $mvnRepo
     Set-GhEnv 'NEXUS_USER' $U
     Set-GhEnv 'NEXUS_PASS' $P
+  }
+}
+
+# SBT / Coursier
+# SBT 1.x resolves via Coursier. Two things are needed:
+#   1. credentials.sbt in ~/.sbt/1.0/ authenticates SBT and its plugin resolver
+#      to the Nexus proxy.
+#   2. COURSIER_REPOSITORIES routes all Coursier artifact fetches through Nexus
+#      instead of Maven Central. COURSIER_CREDENTIALS authenticates the proxy.
+# $sbtRepo defaults to $mvnRepo (maven-public group) because a standard Nexus
+# setup proxies Central through it, which covers the Scala ecosystem too.
+# Override NEXUS_SBT_REPO if you have a dedicated sbt proxy group.
+if ($hasSbt) {
+  Invoke-Eco 'sbt' {
+    $sbtDir = Join-Path $home_ ".sbt\1.0"
+    New-Item -ItemType Directory -Force -Path $sbtDir | Out-Null
+    # PowerShell here-string: closing "@ must start at column 0
+    $credContent = @"
+credentials += Credentials(
+  "Sonatype Nexus Repository Manager",
+  "$hostNoPort",
+  "$U",
+  "$P"
+)
+"@
+    $credContent | Out-File -FilePath (Join-Path $sbtDir "credentials.sbt") -Encoding utf8
+    Write-Host "  + .sbt\1.0\credentials.sbt"
+    # Coursier: pipe-separated resolver list; keep central as fallback
+    $coursierRepos = "$sbtRepo|central"
+    Set-GhEnv 'COURSIER_REPOSITORIES' $coursierRepos
+    # Coursier credentials: "<host> <user>:<pass>" format
+    $coursierCreds = "$hostNoPort ${U}:${P}"
+    Write-Host "::add-mask::$coursierCreds"
+    Set-GhEnv 'COURSIER_CREDENTIALS' $coursierCreds
+    Write-Host "  + COURSIER_REPOSITORIES + COURSIER_CREDENTIALS"
   }
 }
 
