@@ -9,7 +9,7 @@
 #   NEXUS_BASE_URL  e.g. https://nexus.example.com    NEXUS_USER    NEXUS_PASS
 #
 # Optional knobs (all have safe defaults):
-#   NEXUS_MAVEN_REPO  NEXUS_NPM_REPO  NEXUS_PYPI_REPO  NEXUS_GO_REPO  NEXUS_GEMS_REPO
+#   NEXUS_MAVEN_REPO  NEXUS_NPM_REPO  NEXUS_PYPI_REPO  NEXUS_GO_REPO
 #   NEXUS_MAVEN_MIRROR_OF      (default '*')       Maven mirror scope
 #   NEXUS_MAVEN_INJECT_REPO    (default 'true')    add an active profile repo so a pom
 #                                                  that lists no repos still hits Nexus
@@ -17,6 +17,9 @@
 #   NEXUS_COMPOSER_REPO        (composer-type URL) add a global composer repo
 #   NEXUS_COMPOSER_DISABLE_PACKAGIST (default 'false')
 #   NEXUS_GO_PRIVATE           (GOPRIVATE glob; default unset = route all via proxy)
+#   NEXUS_SBT_REPO             (default: NEXUS_MAVEN_REPO)  SBT/Coursier resolver URL;
+#                                                  defaults to the Maven proxy since Nexus
+#                                                  proxies Central through it
 #   NEXUS_MAXDEPTH             (default 4)         manifest search depth
 #   NEXUS_DEBUG               (default 'false')
 
@@ -48,6 +51,7 @@ NEXUS_GO_REPO="${NEXUS_GO_REPO:-${NEXUS_BASE_URL}/repository/go-group/}"
 NEXUS_MAVEN_MIRROR_OF="${NEXUS_MAVEN_MIRROR_OF:-*}"
 NEXUS_MAVEN_INJECT_REPO="${NEXUS_MAVEN_INJECT_REPO:-true}"
 NEXUS_COMPOSER_DISABLE_PACKAGIST="${NEXUS_COMPOSER_DISABLE_PACKAGIST:-false}"
+NEXUS_SBT_REPO="${NEXUS_SBT_REPO:-${NEXUS_MAVEN_REPO}}"
 NEXUS_PIP_TRUSTED_HOST="${NEXUS_PIP_TRUSTED_HOST:-false}"   # opt-in; off keeps TLS verification on
 NEXUS_GO_SUMDB_OFF="${NEXUS_GO_SUMDB_OFF:-false}"           # opt-in; off keeps checksum-db verification
 NEXUS_MAXDEPTH="${NEXUS_MAXDEPTH:-4}"
@@ -91,6 +95,7 @@ have() { [[ -n "$(found "$@")" ]]; }
 
 have_maven()    { have -name pom.xml; }
 have_gradle()   { have -name build.gradle -o -name build.gradle.kts -o -name settings.gradle -o -name settings.gradle.kts; }
+have_sbt()      { have -name build.sbt; }
 have_python()   { have -name 'requirements*.txt' -o -name pyproject.toml -o -name setup.py -o -name setup.cfg -o -name Pipfile; }
 have_npm()      { have -name package.json; }
 have_go()       { have -name go.mod; }
@@ -289,10 +294,50 @@ cfg_ruby() {
   echo "  + BUNDLE_$(bundle_key "$HOST") env (Nexus host only)"
 }
 
+# ---------------- SBT / Coursier ----------------
+cfg_sbt() {
+  # SBT 1.x resolves via Coursier. Two things are needed:
+  #   1. A credentials.sbt file in ~/.sbt/1.0/ so SBT can authenticate to Nexus
+  #      when it sends resolver requests (used by the SBT launcher and plugin
+  #      resolution as well as the build itself).
+  #   2. COURSIER_REPOSITORIES exported to GITHUB_ENV so Coursier routes all
+  #      artifact fetches through the Nexus Maven proxy instead of Maven Central.
+  #      Setting it in GITHUB_ENV makes it available to subsequent steps (the
+  #      actual sbt compile/package invoked by the Veracode packager).
+  #
+  # NEXUS_SBT_REPO defaults to NEXUS_MAVEN_REPO because a standard Nexus setup
+  # proxies Maven Central through the maven-public group, which also satisfies
+  # the Scala/SBT ecosystem. Override NEXUS_SBT_REPO if you have a separate
+  # sbt-specific proxy group.
+
+  mkdir -p "$HOME/.sbt/1.0"
+  cat > "$HOME/.sbt/1.0/credentials.sbt" <<EOF
+credentials += Credentials(
+  "Sonatype Nexus Repository Manager",
+  "${HOST_NOPORT}",
+  "${NEXUS_USER}",
+  "${NEXUS_PASS}"
+)
+EOF
+  # Coursier respects COURSIER_REPOSITORIES as a pipe-separated list of resolvers.
+  # Prepend our Nexus URL so it is tried first; keep the Central fallback in case
+  # the proxy does not mirror everything (e.g. sbt plugins only on sbt-plugin-releases).
+  local coursier_repos="${NEXUS_SBT_REPO}|central"
+  set_env COURSIER_REPOSITORIES "$coursier_repos"
+  # Also pass credentials via the Coursier env so it can authenticate the Nexus proxy.
+  # Mask the combined "host user:pass" string — GitHub only auto-masks the raw secret
+  # values; the derived form slips through unless explicitly registered.
+  local coursier_creds="${HOST_NOPORT} ${NEXUS_USER}:${NEXUS_PASS}"
+  echo "::add-mask::$coursier_creds"
+  set_env COURSIER_CREDENTIALS "$coursier_creds"
+  echo "  + ~/.sbt/1.0/credentials.sbt + COURSIER_REPOSITORIES + COURSIER_CREDENTIALS"
+}
+
 # ---------------- dispatch ----------------
 ( have_python || have_go ) && run netrc cfg_netrc
 have_maven    && run maven    cfg_maven
 have_gradle   && run gradle   cfg_gradle
+have_sbt      && run sbt      cfg_sbt
 have_npm      && run npm      cfg_npm
 have_python   && run pip      cfg_pip
 have_go       && run go       cfg_go
